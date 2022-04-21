@@ -4,13 +4,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
-	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -72,7 +72,6 @@ type timerTrigger struct {
 }
 
 func handler(url string) error {
-	url = path.Clean(url)
 	h := md5.New()
 	resp, err := client.Get(url)
 	if err != nil {
@@ -84,7 +83,8 @@ func handler(url string) error {
 		return err
 	}
 	var oldHash []byte
-	oldHash, err = getFile(url)
+	b64 := base64.URLEncoding.EncodeToString([]byte(url))
+	oldHash, err = getFile(b64)
 	if err != nil {
 		return err
 	}
@@ -96,7 +96,7 @@ func handler(url string) error {
 				e = append(e, err)
 			}
 		}
-		if err = putFile(url, newHash); err != nil {
+		if err = putFile(b64, newHash); err != nil {
 			e = append(e, err)
 		}
 		if len(e) > 0 {
