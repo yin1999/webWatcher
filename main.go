@@ -2,28 +2,31 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"crypto/md5"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"time"
-
-	cos "github.com/tencentyun/cos-go-sdk-v5"
 )
 
-const contentType = "text/plain"
+type handler interface {
+	Next() (payload string, reqID string, err error)
+	ReportError(msg string, id string)
+	ReportSuccess(id string)
+	ossMethod
+}
+
+type ossMethod interface {
+	PutObject(objectName string, data []byte) error
+	GetObject(objectName string) ([]byte, error)
+}
 
 var (
-	reportAPI string
-	cosClient *cos.Client
-	client    = http.Client{
+	client = http.Client{
 		Timeout: 10 * time.Second,
 	}
 	emailCfg = Config{
@@ -35,6 +38,7 @@ var (
 			Password: os.Getenv("SMTP_PASSWORD"),
 		},
 	}
+	fileService ossMethod
 )
 
 func init() {
@@ -43,35 +47,14 @@ func init() {
 }
 
 func main() {
-	u, err := url.Parse(os.Getenv("BUCKET_URL"))
+	handler, err := regist()
 	if err != nil {
 		panic(err)
 	}
-	cosClient = cos.NewClient(&cos.BaseURL{BucketURL: u}, &http.Client{
-		Timeout: 10 * time.Second,
-		Transport: &cos.AuthorizationTransport{
-			SecretID:  os.Getenv("COS_SECRETID"),
-			SecretKey: os.Getenv("COS_SECRETKEY"),
-		},
-	})
-	host := os.Getenv("SCF_RUNTIME_API")
-	port := os.Getenv("SCF_RUNTIME_API_PORT")
-	reportAPI = "http://" + host + ":" + port
-	res, err := http.Post(reportAPI+"/runtime/init/ready", contentType, http.NoBody)
-	if err != nil {
-		panic(err)
-	}
-	res.Body.Close()
-	ListenAndServe(handler)
+	startServe(handler)
 }
 
-type timerTrigger struct {
-	TriggerTime string `json:"Time"`
-	TriggerName string `json:"TriggerName"`
-	Payload     string `json:"Message"`
-}
-
-func handler(url string) error {
+func task(url string, fileService ossMethod) error {
 	h := md5.New()
 	resp, err := client.Get(url)
 	if err != nil {
@@ -84,7 +67,7 @@ func handler(url string) error {
 	}
 	var oldHash []byte
 	b64 := base64.URLEncoding.EncodeToString([]byte(url))
-	oldHash, err = getFile(b64)
+	oldHash, err = fileService.GetObject(b64)
 	if err != nil {
 		return err
 	}
@@ -96,7 +79,7 @@ func handler(url string) error {
 				e = append(e, err)
 			}
 		}
-		if err = putFile(b64, newHash); err != nil {
+		if err = fileService.PutObject(b64, newHash); err != nil {
 			e = append(e, err)
 		}
 		if len(e) > 0 {
@@ -106,76 +89,24 @@ func handler(url string) error {
 	return err
 }
 
-func putFile(name string, data []byte) error {
-	_, err := cosClient.Object.Put(context.Background(), name, bytes.NewReader(data), nil)
-	return err
-}
-
-func getFile(name string) (data []byte, err error) {
-	var isExist bool
-	isExist, err = cosClient.Object.IsExist(context.Background(), name)
-	if err != nil || !isExist {
-		return
-	}
-	var res *cos.Response
-	res, err = cosClient.Object.Get(context.Background(), name, nil)
-	if err != nil {
-		return
-	}
-	defer res.Body.Close()
-	data = make([]byte, res.ContentLength)
-	var n int
-	n, err = res.Body.Read(data)
-	if err == io.EOF {
-		err = nil
-	}
-	data = data[:n]
-	return
-}
-
 func notify(url string) error {
 	return emailCfg.Send("web watcher", "网站更新提醒", fmt.Sprintf("网站地址: %s\n", url))
 }
 
-func ListenAndServe(handler func(payload string) error) error {
+func startServe(h handler) error {
 	for {
-		res, err := http.Get(reportAPI + "/runtime/invocation/next")
+		payload, reqID, err := h.Next()
 		if err != nil {
-			Error.Log("get trigger payload failed, err: %s\n", err.Error())
-			reportError("get payload failed, err: " + err.Error() + "\n")
+			msg := "parse request failed, err: %s" + err.Error()
+			Error.Log(msg)
+			h.ReportError(msg, reqID)
+			continue
 		}
-		requestId := res.Header.Get("Request_id")
-		dec := json.NewDecoder(res.Body)
-		t := &timerTrigger{}
-		err = dec.Decode(t)
-		res.Body.Close() // close body
+		err = task(payload, h)
 		if err != nil {
-			msg := "parse request body failed, err: " + err.Error()
-			Error.Log(msg + "\n")
-			reportError(msg)
-		}
-		err = handler(t.Payload)
-		if err != nil {
-			reportError(err.Error() + "\n")
+			h.ReportError(err.Error()+"\n", reqID)
 		} else {
-			res, err := http.DefaultClient.Post(reportAPI+"/runtime/invocation/response", contentType, strings.NewReader(requestId))
-			if err == nil {
-				res.Body.Close()
-			} else {
-				Fatal.Log(err.Error() + "\n")
-			}
+			h.ReportSuccess(reqID)
 		}
-	}
-}
-
-func reportError(msg string) {
-	res, err := http.DefaultClient.Post(reportAPI+"/runtime/invocation/error",
-		contentType,
-		strings.NewReader(msg),
-	)
-	if err == nil {
-		res.Body.Close()
-	} else {
-		Error.Log(err.Error() + "\n")
 	}
 }
