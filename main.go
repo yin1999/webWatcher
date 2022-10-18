@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"crypto/md5"
+	"crypto/tls"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -44,6 +45,9 @@ var (
 func init() {
 	port := os.Getenv("SMTP_PORT")
 	emailCfg.SMTP.Port, _ = strconv.Atoi(port)
+	if os.Getenv("INSECURE") == "1" {
+		http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	}
 }
 
 func main() {
